@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { normalizeCookie, type Config } from "./config.js";
@@ -77,60 +77,89 @@ async function getOrCreateContext(cookieRaw: string): Promise<AppContext> {
   }
 }
 
-// --- extract cookie from Authorization header or query param ---
+// --- MCP authentication ---
 
-function extractCookie(req: { headers: Record<string, string | undefined>; url?: string }): string | null {
+function extractBearerToken(req: { headers: Record<string, string | string[] | undefined> }): string | null {
   const auth = req.headers.authorization;
-  if (auth) {
-    const match = auth.match(/^Bearer\s+(.+)$/i);
-    if (match?.[1]) return match[1];
+
+  if (typeof auth !== "string") {
+    return null;
   }
 
-  // Fall back to ?token= query parameter (for clients without Bearer support)
-  if (req.url) {
-    const url = new URL(req.url, "http://localhost");
-    const token = url.searchParams.get("token");
-    if (token) return token;
-  }
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
 
-  return null;
+function tokensMatch(actual: string, expected: string): boolean {
+  // Hash both values first so timingSafeEqual always receives equal-length buffers.
+  const actualHash = createHash("sha256").update(actual).digest();
+  const expectedHash = createHash("sha256").update(expected).digest();
+
+  return timingSafeEqual(actualHash, expectedHash);
 }
 
 // --- HTTP server ---
-
 async function main() {
+  // The Wanderlog session stays server-side and is never used as the public
+  // MCP authentication credential.
+  const wanderlogCookie = process.env.WANDERLOG_COOKIE?.trim();
+
+  if (!wanderlogCookie) {
+    throw new Error(
+      "WANDERLOG_COOKIE is required. Set it to your Wanderlog connect.sid value.",
+    );
+  }
+
+  // Fail fast if the cookie has the wrong format.
+  normalizeCookie(wanderlogCookie);
+
+  const mcpAuthToken = process.env.MCP_AUTH_TOKEN?.trim();
+
+  if (!mcpAuthToken) {
+    throw new Error(
+      "MCP_AUTH_TOKEN is required. Generate a separate random token; do not reuse your Wanderlog connect.sid.",
+    );
+  }
+
+  if (mcpAuthToken.length < 32) {
+    throw new Error(
+      "MCP_AUTH_TOKEN must be at least 32 characters long.",
+    );
+  }
+
   const app = createMcpExpressApp({ host: "0.0.0.0" });
 
   // All MCP methods (POST, GET, DELETE) go through auth + transport so
   // the transport itself decides what's allowed per the spec.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleMcp = async (req: any, res: any) => {
-    const cookie = extractCookie(req);
-    if (!cookie) {
-      res.status(401).json({
-        jsonrpc: "2.0",
-        error: {
-          code: -32000,
-          message:
-            "Missing Authorization header. Set Bearer token to your Wanderlog connect.sid cookie value.",
-        },
-        id: null,
-      });
-      return;
-    }
+  const bearerToken = extractBearerToken(req);
+  
+  if (!bearerToken || !tokensMatch(bearerToken, mcpAuthToken)) {
+    res.status(401).json({
+      jsonrpc: "2.0",
+      error: {
+        code: -32000,
+        message:
+          "Missing or invalid Authorization header. Use MCP_AUTH_TOKEN as the Bearer token.",
+      },
+      id: null,
+    });
+    return;
+  }
 
     let ctx: AppContext;
     try {
-      ctx = await getOrCreateContext(cookie);
+      ctx = await getOrCreateContext(wanderlogCookie);
     } catch (err) {
       const msg =
         err instanceof WanderlogError
           ? err.toUserMessage()
           : (err as Error).message;
-      console.error(`[wanderdog] auth failed: ${msg}`);
+      console.error(`[wanderdog] Wanderlog auth failed: ${msg}`);
       res.status(403).json({
         jsonrpc: "2.0",
-        error: { code: -32000, message: `Authentication failed: ${msg}` },
+        error: { code: -32000, message: `Wanderlog authentication failed: ${msg}` },
         id: null,
       });
       return;
